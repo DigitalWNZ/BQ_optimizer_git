@@ -50,12 +50,14 @@ def get_tbl_prop(client, tbl_id):
     tbl_properties['mview_query'] = tbl.mview_query
     tbl_properties['table_type'] = tbl.table_type
     if tbl.table_type == 'TABLE':
-        if tbl.partitioning_type is not None or tbl.range_partitioning is not None:
-            tbl_properties['table_and_partition'] = 3
+        if tbl.range_partitioning is not None:
+            tbl_properties['table_and_partition'] = 4 #integer partition
+        elif tbl.partitioning_type is not None  :
+            tbl_properties['table_and_partition'] = 3   #time partition
         else:
-            tbl_properties['table_and_partition'] = 2
+            tbl_properties['table_and_partition'] = 2 # pure table
     else:
-        tbl_properties['table_and_partition'] = 1
+        tbl_properties['table_and_partition'] = 1 # not table
 
     return tbl_properties
 
@@ -80,11 +82,18 @@ def export_table_partitions(client, tbl_id,table_item,gcs_client):
         if bucket_exist(table_item['input_project'],bucket_name):
             gcs_url='gs://{}/{}/{}/dt='.format(bucket_name,table_item['input_dataset'],table_item['input_table'])
         else:
-            new_bucket_name=table_item['input_project'] + '-external-data'
-            if not bucket_exist(table_item['input_project'], new_bucket_name):
-                gcs_client.create_bucket(new_bucket_name,location=table_item['tbl_properties']['location'],project=table_item['input_project'])
-                ###TODO: apply policy
-            gcs_url = 'gs://{}/{}/{}/dt='.format(new_bucket_name, table_item['input_dataset'], table_item['input_table'])
+            if bucket_name == '':
+                new_bucket_name=table_item['input_project'] + '-external-data'
+                if not bucket_exist(table_item['input_project'], new_bucket_name):
+                    gcs_client.create_bucket(new_bucket_name,location=table_item['tbl_properties']['location'],project=table_item['input_project'])
+                    ###TODO: apply policy
+                gcs_url = 'gs://{}/{}/{}/dt='.format(new_bucket_name, table_item['input_dataset'], table_item['input_table'])
+            else:
+                gcs_client.create_bucket(bucket_name, location=table_item['tbl_properties']['location'],
+                                         project=table_item['input_project'])
+                gcs_url = 'gs://{}/{}/{}/dt='.format(bucket_name, table_item['input_dataset'],
+                                                 table_item['input_table'])
+
 
         for partition in partitions:
             dt_partition=datetime.strptime(partition,'%Y%m%d').date()
@@ -92,7 +101,9 @@ def export_table_partitions(client, tbl_id,table_item,gcs_client):
             if dt_partition <= start_partition:
                 print('Extracting partition {}${} to {}'.format(tbl_id,partition,gcs_url))
                 try:
-                    extract_job = client.extract_table(tbl_id + '$' +partition,gcs_url,location=table_item['tbl_properties']['location'])
+                    job_config = bigquery.job.ExtractJobConfig()
+                    job_config.destination_format='AVRO'
+                    extract_job = client.extract_table(tbl_id + '$' +partition,gcs_url,location=table_item['tbl_properties']['location'],job_config=job_config)
                     job_created=extract_job.created
                     job_id=extract_job.job_id
                     job_state=extract_job.state
@@ -110,28 +121,226 @@ def export_table_partitions(client, tbl_id,table_item,gcs_client):
                 except Exception:
                     raise Exception('Something went wrong when exporting partition {}${}'.format(tbl_id,partition))
 
-                if table_item['name_ext_table'] !='':
-                    if not ('.' in name_ext_table):
-                        raise ValueError('Please use full table name for external table {}'.format(table_item['name_ext_table']))
+        name_ext_table = table_item['name_ext_table']
+        if  name_ext_table !='':
+            if not ('.' in name_ext_table):
+                raise ValueError('Please use full table name for external table {}'.format(name_ext_table))
 
-                    if not validate_table(client,table_item['name_ext_table']):
-                        name_ext_table = table_item['input_project'] + '.' + table_item['input_dataset'] + '.' + table_item['input_table'] + '_ext'
-                        if not validate_table(client,name_ext_table):
-                            continue
+            if not validate_table(client,name_ext_table):
+                # name_ext_table = table_item['input_project'] + '.' + table_item['input_dataset'] + '.' + table_item['input_table'] + '_ext'
+                if not validate_table(client,name_ext_table):
+                    create_external_table(client,name_ext_table,gcs_url)
+            else:
+                print('External table {} alreday existed, so will not create external table.'.format(name_ext_table))
+        else:
+            name_ext_table = table_item['input_project'] + '.' + table_item['input_dataset'] + '.' + table_item['input_table'] + '_ext'
+            if not validate_table(client, name_ext_table):
+                ext_table=create_external_table(client, name_ext_table,gcs_url)
+            else:
+                print('External table {} alreday existed, so will not create external table.'.format(name_ext_table))
+
+def export_table_sql(client, tbl_id,table_item,gcs_client):
+    bucket_name = table_item['gcs_dest_bucket']
+    if '*' in tbl_id:
+        tbl_id=tbl_id.replace('*','')
+
+    today = date.today()
+    str_today= today.strftime("%Y-%m-%d")
+
+    if bucket_exist(table_item['input_project'], bucket_name):
+        gcs_url = 'gs://{}/{}/{}/dt={}'.format(bucket_name, table_item['input_dataset'], table_item['input_table'],str_today)
+    else:
+        if bucket_name == '':
+            new_bucket_name = table_item['input_project'] + '-external-data'
+            if not bucket_exist(table_item['input_project'], new_bucket_name):
+                gcs_client.create_bucket(new_bucket_name, location=table_item['tbl_properties']['location'],
+                                         project=table_item['input_project'])
+                ###TODO: apply policy
+            gcs_url = 'gs://{}/{}/{}/dt={}'.format(new_bucket_name, table_item['input_dataset'],
+                                                 table_item['input_table'],str_today)
+        else:
+            gcs_client.create_bucket(bucket_name, location=table_item['tbl_properties']['location'],
+                                     project=table_item['input_project'])
+            gcs_url = 'gs://{}/{}/{}/dt={}'.format(bucket_name, table_item['input_dataset'],
+                                                 table_item['input_table'],str_today)
+
+    # sql = '"""export data options (uri=\'' + gcs_url + '/*.avro\',\n'\
+    #     + 'format = \'AVRO\') as \n ' \
+    #     + table_item['select_date_for_exporting'] \
+    #     + '"""'
+    sql = "export data options (uri='" + gcs_url + "/*.avro',\n"\
+        + "format = 'AVRO') as \n " \
+        + table_item['select_date_for_exporting']
+
+    print(sql)
+    query_job= client.query(sql)
+    job_created = query_job.created
+    job_id = query_job.job_id
+    job_state = query_job.state
+    print('Extracting table {}, the job id is {}'.format(tbl_id, job_id))
+    wait_index = 1
+    while job_state == 'RUNNING':
+        print('waiting for {} seconds'.format(str(wait_index * 10)))
+        time.sleep(10)
+        query_job = client.get_job(job_id)
+        job_state = query_job.state
+        wait_index += 1
+    job_ended = query_job.ended
+    job_duration = job_ended - job_created
+    print('The job completed in {}'.format(str(job_duration)))
+
+    name_ext_table = table_item['name_ext_table']
+    if name_ext_table != '':
+        if not ('.' in name_ext_table):
+            raise ValueError('Please use full table name for external table {}'.format(name_ext_table))
+
+        if not validate_table(client, name_ext_table):
+            # name_ext_table = table_item['input_project'] + '.' + table_item['input_dataset'] + '.' + table_item['input_table'] + '_ext'
+            if not validate_table(client, name_ext_table):
+                create_external_table(client, name_ext_table, gcs_url)
+        else:
+            print('External table {} alreday existed, so will not create external table.'.format(name_ext_table))
+    else:
+        name_ext_table = table_item['input_project'] + '.' + table_item['input_dataset'] + '.' + table_item[
+            'input_table'] + '_ext'
+        if not validate_table(client, name_ext_table):
+            ext_table = create_external_table(client, name_ext_table, gcs_url)
+        else:
+            print('External table {} alreday existed, so will not create external table.'.format(name_ext_table))
+
+def export_table_shards(client, tbl_id,table_item,gcs_client):
+
+    shards=table_item['table_name_pattern'].split(',')
+    gcs_table_id=table_item['input_table'].replace('*','')
+    if len(shards) > 0:
+        bucket_name = table_item['gcs_dest_bucket']
+
+        if bucket_exist(table_item['input_project'],bucket_name):
+            gcs_url='gs://{}/{}/{}/suffix='.format(bucket_name,table_item['input_dataset'],gcs_table_id)
+        else:
+            if bucket_name == '':
+                new_bucket_name=table_item['input_project'] + '-external-data'
+                if not bucket_exist(table_item['input_project'], new_bucket_name):
+                    gcs_client.create_bucket(new_bucket_name,location=table_item['tbl_properties']['location'],project=table_item['input_project'])
+                    ###TODO: apply policy
+                gcs_url = 'gs://{}/{}/{}/suffix='.format(new_bucket_name, table_item['input_dataset'], gcs_table_id)
+            else:
+                gcs_client.create_bucket(bucket_name, location=table_item['tbl_properties']['location'],
+                                         project=table_item['input_project'])
+                gcs_url = 'gs://{}/{}/{}/suffix='.format(bucket_name, table_item['input_dataset'],gcs_table_id)
 
 
+        for shard in shards:
+            shard_tbl_id=tbl_id.replace('*',shard)
 
+            if not validate_table(client,shard_tbl_id):
+                raise ValueError('Shard table {} does not exist'.format(shard_tbl_id))
+            gcs_url=gcs_url + '{}/*.avro'.format(shard)
+            print('Extracting shard table {} to {}'.format(shard_tbl_id,gcs_url))
+            try:
+                job_config = bigquery.job.ExtractJobConfig()
+                job_config.destination_format='AVRO'
+                extract_job = client.extract_table(shard_tbl_id,gcs_url,location=table_item['tbl_properties']['location'],job_config=job_config)
+                job_created=extract_job.created
+                job_id=extract_job.job_id
+                job_state=extract_job.state
+                print('Extracting  shard table {}, the job id is {}'.format(shard_tbl_id,job_id))
+                wait_index=1
+                while job_state == 'RUNNING':
+                    print('waiting for {} seconds'.format(str(wait_index * 10)))
+                    time.sleep(10)
+                    extract_job=client.get_job(job_id)
+                    job_state=extract_job.state
+                    wait_index +=1
+                job_ended = extract_job.ended
+                job_duration = job_ended - job_created
+                print('The job completed in {}'.format(str(job_duration)))
+            except Exception:
+                raise Exception('Something went wrong when exporting partition {}'.format(tbl_id))
 
-def create_external_table(client,table_item):
-    exit(0)
+        name_ext_table = table_item['name_ext_table']
+        if  name_ext_table !='':
+            if not ('.' in name_ext_table):
+                raise ValueError('Please use full table name for external table {}'.format(name_ext_table))
 
+            if not validate_table(client,name_ext_table):
+                # name_ext_table = table_item['input_project'] + '.' + table_item['input_dataset'] + '.' + table_item['input_table'] + '_ext'
+                if not validate_table(client,name_ext_table):
+                    create_external_table_shard(client,name_ext_table,gcs_url)
+            else:
+                print('External table {} alreday existed, so will not create external table.'.format(name_ext_table))
+        else:
+            name_ext_table = table_item['input_project'] + '.' + table_item['input_dataset'] + '.' + table_item['input_table'].replace('*','') + '_ext'
+            if not validate_table(client, name_ext_table):
+                ext_table=create_external_table_shard(client, name_ext_table,gcs_url)
+            else:
+                print('External table {} alreday existed, so will not create external table.'.format(name_ext_table))
+
+def create_external_table(client,table_id,gcs_url):
+    uri_pattern='^(.*)/dt=.*$'
+    pattern = re.compile(uri_pattern, re.IGNORECASE)
+    gcs_uri_pattern = pattern.findall(gcs_url)[0]
+    uri = gcs_uri_pattern + '/*'
+    gcs_uri_prefix=gcs_uri_pattern + '/{dt:DATE}'
+
+    external_config = bigquery.ExternalConfig("AVRO")
+    external_config.source_uris = [uri]
+    external_config.autodetect = True
+
+    # Configure partitioning options.
+    hive_partitioning_opts = bigquery.external_config.HivePartitioningOptions()
+
+    hive_partitioning_opts.mode = "CUSTOM"
+    hive_partitioning_opts.require_partition_filter = True
+    hive_partitioning_opts.source_uri_prefix = gcs_uri_prefix
+
+    external_config.hive_partitioning = hive_partitioning_opts
+
+    table = bigquery.Table(table_id)
+    table.external_data_configuration = external_config
+    try:
+        table = client.create_table(table)  # Make an API request.
+        print('Created table {}.{}.{}'.format(table.project, table.dataset_id, table.table_id))
+    except Exception:
+        print('Failed to create external table {}.{}.{}'.format(table.project, table.dataset_id, table.table_id))
+
+    return table
+
+def create_external_table_shard(client,table_id,gcs_url):
+    uri_pattern='^(.*)/suffix=.*$'
+    pattern = re.compile(uri_pattern, re.IGNORECASE)
+    gcs_uri_pattern = pattern.findall(gcs_url)[0]
+    uri = gcs_uri_pattern + '/*'
+    gcs_uri_prefix=gcs_uri_pattern + '/'
+
+    external_config = bigquery.ExternalConfig("AVRO")
+    external_config.source_uris = [uri]
+    external_config.autodetect = True
+
+    # Configure partitioning options.
+    hive_partitioning_opts = bigquery.external_config.HivePartitioningOptions()
+
+    hive_partitioning_opts.mode = "AUTO"
+    hive_partitioning_opts.require_partition_filter = True
+    hive_partitioning_opts.source_uri_prefix = gcs_uri_prefix
+
+    external_config.hive_partitioning = hive_partitioning_opts
+
+    table = bigquery.Table(table_id)
+    table.external_data_configuration = external_config
+    try:
+        table = client.create_table(table)  # Make an API request.
+        print('Created table {}.{}.{}'.format(table.project, table.dataset_id, table.table_id))
+    except Exception:
+        print('Failed to create external table {}.{}.{}'.format(table.project, table.dataset_id, table.table_id))
+
+    return table
 
 if __name__ == '__main__':
 
     # Value to be changed
     path_to_credential = '/Users/wangez/Downloads/allen-first-1b9a548ebc7b.json'
-    sheet_url = 'https://docs.google.com/spreadsheets/d/1KbkOtCZ9voavehT44X8GMtjiTE7NWxc7FN52gsEsxX3E/edit#gid=0'
-
+    sheet_url = 'https://docs.google.com/spreadsheets/d/1KbkOtCZ9vovehT44X8GMtjiTE7NWxc7FN52gsEsxX3E/edit?usp=sharing'
     getid = '^.*/d/(.*)/.*$'
     pattern = re.compile(getid, re.IGNORECASE)
     sheet_id = pattern.findall(sheet_url)[0]
@@ -187,7 +396,7 @@ if __name__ == '__main__':
         else:
             if input_dataset !='*' and input_table !='' and input_table != '*':
                 tbl_id = input_project + '.' + input_dataset + '.' + input_table
-                if not validate_table(client,tbl_id):
+                if not validate_table(client,tbl_id) and not '*' in tbl_id:
                     raise ValueError("Error in row {} - table is not valid ".format(str(row_num)))
 
         days_before_remove = row[3]
@@ -236,6 +445,9 @@ if __name__ == '__main__':
         except ValueError:
             raise ValueError('gcs life cycle policy in row {} is not a valid json'.format(str(row_num)))
 
+        select_date_for_exporting = row[9]
+        table_name_pattern= row[10]
+
         if input_dataset == '*':
             datasets = client.list_datasets(input_project)
             if datasets:
@@ -250,13 +462,16 @@ if __name__ == '__main__':
                                 'input_project':input_project,
                                 'input_dataset':dataset.dataset_id,
                                 'input_table':table.table_id,
+                                'tbl_id':tbl_id,
                                 'tbl_properties':tbl_properties,
                                 'days_before_remove':days_before_remove,
                                 'days_before_export':days_before_export,
                                 'remove_orig_data':remove_orig_data,
                                 'gcs_dest_bucket':gcs_dest_bucket,
                                 'name_ext_table':name_ext_table,
-                                'gcs_lifecycle_policy':gcs_lifecycle_policy
+                                'gcs_lifecycle_policy':gcs_lifecycle_policy,
+                                'select_date_for_exporting':select_date_for_exporting,
+                                'table_name_pattern':table_name_pattern
                             }
                             list_ops_by_table.append(dict_ops_by_table)
                     else:
@@ -274,50 +489,94 @@ if __name__ == '__main__':
                         'input_project': input_project,
                         'input_dataset': input_dataset,
                         'input_table': table.table_id,
+                        'tbl_id':tbl_id,
                         'tbl_properties': tbl_properties,
                         'days_before_remove': days_before_remove,
                         'days_before_export': days_before_export,
                         'remove_orig_data': remove_orig_data,
                         'gcs_dest_bucket': gcs_dest_bucket,
                         'name_ext_table': name_ext_table,
-                        'gcs_lifecycle_policy': gcs_lifecycle_policy
+                        'gcs_lifecycle_policy': gcs_lifecycle_policy,
+                        'select_date_for_exporting': select_date_for_exporting,
+                        'table_name_pattern': table_name_pattern
                     }
                     list_ops_by_table.append(dict_ops_by_table)
             else:
                 print('No tables found in dataset {}'.format(ds_id))
         else:
             tbl_id=input_project + '.' + input_dataset + '.' + input_table
+            if '*' in tbl_id:
+                tbl_id=tbl_id.replace('*',table_name_pattern)
+
             tbl_properties = get_tbl_prop(client, tbl_id)
             dict_ops_by_table = {
                 'input_project': input_project,
                 'input_dataset': input_dataset,
                 'input_table': input_table,
+                'tbl_id':tbl_id,
                 'tbl_properties': tbl_properties,
                 'days_before_remove': days_before_remove,
                 'days_before_export': days_before_export,
                 'remove_orig_data': remove_orig_data,
                 'gcs_dest_bucket': gcs_dest_bucket,
                 'name_ext_table': name_ext_table,
-                'gcs_lifecycle_policy': gcs_lifecycle_policy
+                'gcs_lifecycle_policy': gcs_lifecycle_policy,
+                'select_date_for_exporting': select_date_for_exporting,
+                'table_name_pattern': table_name_pattern
             }
             list_ops_by_table.append(dict_ops_by_table)
         print('Complete parsing row {}'.format(str(row_num)))
         row_num += 1
     list_ops_by_phy_table = [x for x in list_ops_by_table if x['tbl_properties']['table_and_partition'] >= 2]
-    list_ops_by_par_table = [x for x in list_ops_by_table if x['tbl_properties']['table_and_partition'] == 3]
+    list_ops_by_par_table = [x for x in list_ops_by_table if x['tbl_properties']['table_and_partition'] >= 3]
     print('Complete parsing {} inputs and find {} physical tables in which there are {} partition tables' \
           .format(str(len(values)),str(len(list_ops_by_phy_table)),str(len(list_ops_by_par_table))))
 
+    print('----------------Check Duplicate table----------------')
+    seen={}
+    for item in list_ops_by_phy_table:
+        if item['tbl_id'] in seen.keys():
+            seen[item['tbl_id']] +=1
+        else:
+            seen[item['tbl_id']]=1
+    duplicate_items = {k:v for k,v in seen.items() if v>1}
+    if len(duplicate_items) > 0:
+        print(duplicate_items)
+        raise ValueError('There are duplicate tables specified in the input files, please check in the input')
+
     print('----------------Phase 2 - Processing Tables ----------------')
-    for item in list_ops_by_par_table:
+    for item in list_ops_by_phy_table:
         tbl_id=item['input_project'] + '.' + item['input_dataset'] + '.' + item['input_table']
         print('Processing table {}'.format(tbl_id))
+        if item['tbl_properties']['table_and_partition']==4:
+            continue
+        elif item['tbl_properties']['table_and_partition']==3 and \
+            (item['days_before_remove'] > 0 or item['days_before_export'] > 0):
+            if item['days_before_remove'] > 0:
+                # Remove partition
+                # remove_table_partitions(client,tbl_id,item)
+                continue
+            elif item['days_before_export'] > 0:
+                export_table_partitions(client, tbl_id, item,gcs_client)
+        elif item['tbl_properties']['table_and_partition']==3 and \
+             item['days_before_remove'] == 0 and item['days_before_export'] == 0:
+            if item['select_date_for_exporting'] == '':
+                print('There is no operation specified for table {}'.format(tbl_id))
+            else:
+                export_table_sql(client,tbl_id,item,gcs_client)
+        elif item['tbl_properties']['table_and_partition']==2:
+            if '*' in item['input_table']:
+                if item['select_date_for_exporting'] =='' and item['table_name_pattern'] =='':
+                    print('There is no operation specified for table {}'.format(tbl_id))
+                elif item['table_name_pattern'] == '':
+                    export_table_sql(client, tbl_id, item, gcs_client)
+                else:
+                    export_table_shards(client,tbl_id,item,gcs_client)
+            else:
+                if item['select_date_for_exporting'] == '':
+                    print('There is no operation specified for table {}'.format(tbl_id))
+                else:
+                    export_table_sql(client,tbl_id,item,gcs_client)
 
-        if item['days_before_remove'] > 0:
-            # Remove partition
-            # remove_table_partitions(client,tbl_id,item)
-            continue
-        elif item['days_before_export'] > 0:
-            export_table_partitions(client, tbl_id, item,gcs_client)
         else:
-            continue
+            print('table {} is not a physical table'.format(tbl_id) )
