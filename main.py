@@ -85,7 +85,9 @@ def export_table_partitions(client, tbl_id,table_item,gcs_client):
             if bucket_name == '':
                 new_bucket_name=table_item['input_project'] + '-external-data'
                 if not bucket_exist(table_item['input_project'], new_bucket_name):
-                    gcs_client.create_bucket(new_bucket_name,location=table_item['tbl_properties']['location'],project=table_item['input_project'])
+                    new_bucket=gcs_client.bucket(new_bucket_name)
+                    new_bucket.storage_class= table_item['gcs_storage_class']
+                    gcs_client.create_bucket(new_bucket,location=table_item['tbl_properties']['location'],project=table_item['input_project'])
                     ###TODO: apply policy
                 gcs_url = 'gs://{}/{}/{}/dt='.format(new_bucket_name, table_item['input_dataset'], table_item['input_table'])
             else:
@@ -97,13 +99,13 @@ def export_table_partitions(client, tbl_id,table_item,gcs_client):
 
         for partition in partitions:
             dt_partition=datetime.strptime(partition,'%Y%m%d').date()
-            gcs_url=gcs_url + '{}/*.avro'.format(str(dt_partition))
+            full_gcs_url=gcs_url + '{}/*.avro'.format(str(dt_partition))
             if dt_partition <= start_partition:
-                print('Extracting partition {}${} to {}'.format(tbl_id,partition,gcs_url))
+                print('Extracting partition {}${} to {}'.format(tbl_id,partition,full_gcs_url))
                 try:
                     job_config = bigquery.job.ExtractJobConfig()
                     job_config.destination_format='AVRO'
-                    extract_job = client.extract_table(tbl_id + '$' +partition,gcs_url,location=table_item['tbl_properties']['location'],job_config=job_config)
+                    extract_job = client.extract_table(tbl_id + '$' +partition,full_gcs_url,location=table_item['tbl_properties']['location'],job_config=job_config)
                     job_created=extract_job.created
                     job_id=extract_job.job_id
                     job_state=extract_job.state
@@ -153,9 +155,10 @@ def export_table_sql(client, tbl_id,table_item,gcs_client):
         if bucket_name == '':
             new_bucket_name = table_item['input_project'] + '-external-data'
             if not bucket_exist(table_item['input_project'], new_bucket_name):
+                new_bucket = gcs_client.bucket(new_bucket_name)
+                new_bucket.storage_class = table_item['gcs_storage_class']
                 gcs_client.create_bucket(new_bucket_name, location=table_item['tbl_properties']['location'],
                                          project=table_item['input_project'])
-                ###TODO: apply policy
             gcs_url = 'gs://{}/{}/{}/dt={}'.format(new_bucket_name, table_item['input_dataset'],
                                                    table_item['input_table'],str_today)
         else:
@@ -212,11 +215,15 @@ def export_table_list(client, tbl_id,table_item,gcs_client):
     if ',' in table_item['table_name_pattern']:
         shards= table_item['table_name_pattern'].split(',')
     else:
-        shards = [].append(table_item['table_name_pattern'])
+        shards=[]
+        shards.append(table_item['table_name_pattern'])
 
     location=''
     for shard in shards:
-        shard_tbl_id = tbl_id.replace('*', shard)
+        if '*' in tbl_id:
+            shard_tbl_id = tbl_id.replace('*', shard)
+        else:
+            shard_tbl_id = tbl_id.replace('{YYYYMMDD}', shard)
         if validate_table(client, shard_tbl_id):
             tbl_properties = get_tbl_prop(client, shard_tbl_id)
             location = tbl_properties['location']
@@ -233,8 +240,9 @@ def export_table_list(client, tbl_id,table_item,gcs_client):
             if bucket_name == '':
                 new_bucket_name=table_item['input_project'] + '-external-data'
                 if not bucket_exist(table_item['input_project'], new_bucket_name):
+                    new_bucket=gcs_client.bucket(new_bucket_name)
+                    new_bucket.storage_class= table_item['gcs_storage_class']
                     gcs_client.create_bucket(new_bucket_name,location=location,project=table_item['input_project'])
-                    ###TODO: apply policy
                 gcs_url = 'gs://{}/{}/{}/suffix='.format(new_bucket_name, table_item['input_dataset'], gcs_table_id)
             else:
                 gcs_client.create_bucket(bucket_name, location=location,
@@ -246,13 +254,16 @@ def export_table_list(client, tbl_id,table_item,gcs_client):
             shard_tbl_id=tbl_id.replace('*',shard)
             if not validate_table(client,shard_tbl_id):
                 raise ValueError('Shard table {} does not exist'.format(shard_tbl_id))
-
-            gcs_url=gcs_url + '{}/*.avro'.format(shard)
-            print('Extracting shard table {} to {}'.format(shard_tbl_id,gcs_url))
+            try:
+                transformed_shard = str(datetime.strptime(shard,'%Y%m%d').date())
+            except Exception:
+                transformed_shard=shard
+            full_gcs_url=gcs_url + '{}/*.avro'.format(transformed_shard)
+            print('Extracting shard table {} to {}'.format(shard_tbl_id,full_gcs_url))
             try:
                 job_config = bigquery.job.ExtractJobConfig()
                 job_config.destination_format='AVRO'
-                extract_job = client.extract_table(shard_tbl_id,gcs_url,location=location,job_config=job_config)
+                extract_job = client.extract_table(shard_tbl_id,full_gcs_url,location=location,job_config=job_config)
                 job_created=extract_job.created
                 job_id=extract_job.job_id
                 job_state=extract_job.state
@@ -291,22 +302,25 @@ def export_table_list(client, tbl_id,table_item,gcs_client):
 def export_table_shards(client, tbl_id,table_item,gcs_client):
     shards=[]
 
-    ds_id = table_item['input_project'] + '.' + table_item['dataset_id']
+    ds_id = table_item['input_project'] + '.' + table_item['input_dataset']
     tables = client.list_tables(ds_id)
     if tables:
         full_table_list = [x.table_id for x in tables]
         start_date = date.today() - timedelta(days=table_item['days_before_export'])
-        for idx in range(len(full_table_list)):
-            temp_dt=start_date - timedelta(days=idx)
-            temp_dt_str=datetime.strftime(temp_dt, '%Y%m%d')
-            temp_table_name=table_item['input_table'].replace('{YYYYMMDD}',temp_dt_str)
-            if temp_table_name in full_table_list:
-                shards.append(temp_table_name)
+        table_suffix=table_item['input_table'].replace('{YYYYMMDD}','')
+        len_table_suffix=len(table_suffix)
+        table_pattern = '^'+ table_suffix + '[0-9]{8}$'
+        pattern = re.compile(table_pattern, re.IGNORECASE)
+        for tbl in full_table_list:
+            found= pattern.findall(tbl)
+            if len(found) > 0:
+                shards.append(tbl)
     else:
         print('The input dataset {} has no table in it.'.format(ds_id))
 
     if len(shards) > 0:
-        tbl_properties = get_tbl_prop(client, shards[0])
+        tbl_id=ds_id + '.' + shards[0]
+        tbl_properties = get_tbl_prop(client, tbl_id)
         location = tbl_properties['location']
 
         gcs_table_id=table_item['input_table'].replace('{YYYYMMDD}','')
@@ -319,8 +333,9 @@ def export_table_shards(client, tbl_id,table_item,gcs_client):
                 if bucket_name == '':
                     new_bucket_name=table_item['input_project'] + '-external-data'
                     if not bucket_exist(table_item['input_project'], new_bucket_name):
+                        new_bucket = gcs_client.bucket(new_bucket_name)
+                        new_bucket.storage_class = table_item['gcs_storage_class']
                         gcs_client.create_bucket(new_bucket_name,location=location,project=table_item['input_project'])
-                        ###TODO: apply policy
                     gcs_url = 'gs://{}/{}/{}/suffix='.format(new_bucket_name, table_item['input_dataset'], gcs_table_id)
                 else:
                     gcs_client.create_bucket(bucket_name, location=location,project=table_item['input_project'])
@@ -331,12 +346,12 @@ def export_table_shards(client, tbl_id,table_item,gcs_client):
                 shard_tbl_id= ds_id + '.' + shard
                 if not validate_table(client,shard_tbl_id):
                     raise ValueError('Shard table {} does not exist'.format(shard_tbl_id))
-                gcs_url=gcs_url + '{}/*.avro'.format(shard)
-                print('Extracting shard table {} to {}'.format(shard_tbl_id,gcs_url))
+                full_gcs_url=gcs_url + '{}/*.avro'.format(str(datetime.strptime(shard[len_table_suffix:],'%Y%m%d').date()))
+                print('Extracting shard table {} to {}'.format(shard_tbl_id,full_gcs_url))
                 try:
                     job_config = bigquery.job.ExtractJobConfig()
                     job_config.destination_format='AVRO'
-                    extract_job = client.extract_table(shard_tbl_id,gcs_url,location=location,job_config=job_config)
+                    extract_job = client.extract_table(shard_tbl_id,full_gcs_url,location=location,job_config=job_config)
                     job_created=extract_job.created
                     job_id=extract_job.job_id
                     job_state=extract_job.state
@@ -366,7 +381,7 @@ def export_table_shards(client, tbl_id,table_item,gcs_client):
                 else:
                     print('External table {} alreday existed, so will not create external table.'.format(name_ext_table))
             else:
-                name_ext_table = table_item['input_project'] + '.' + table_item['input_dataset'] + '.' + table_item['input_table'].replace('*','') + '_ext'
+                name_ext_table = table_item['input_project'] + '.' + table_item['input_dataset'] + '.' + table_item['input_table'].replace('{YYYYMMDD}','') + '_ext'
                 if not validate_table(client, name_ext_table):
                     ext_table=create_external_table_shard(client, name_ext_table,gcs_url)
                 else:
@@ -435,10 +450,13 @@ def create_external_table_shard(client,table_id,gcs_url):
     return table
 
 if __name__ == '__main__':
-
-
     # Value to be changed
-    path_to_credential = '/Users/wangez/Downloads/allen-first-1b9a548ebc7b.json'
+    # name= 'events_20200901'
+    # table_pattern = '^events_'+ '[0-9]{8}$'
+    # pattern = re.compile(table_pattern, re.IGNORECASE)
+    # found = pattern.findall(name)
+
+    path_to_credential = '/Users/wangez/Downloads/allen-first-8d361c053705.json'
     sheet_url = 'https://docs.google.com/spreadsheets/d/1KbkOtCZ9vovehT44X8GMtjiTE7NWxc7FN52gsEsxX3E/edit?usp=sharing'
     getid = '^.*/d/(.*)/.*$'
     pattern = re.compile(getid, re.IGNORECASE)
@@ -497,7 +515,7 @@ if __name__ == '__main__':
         if input_dataset != '*' and input_table == '':
             raise ValueError("Error in row {} - partitioned_table can not be null".format(str(row_num)))
         else:
-            if input_dataset !='*' and input_table !='' and input_table != '*':
+            if input_dataset !='*' and input_table !='' and input_table != '*' and '{YYYYMMDD}' not in input_table:
                 tbl_id = input_project + '.' + input_dataset + '.' + input_table
                 if not validate_table(client,tbl_id) and not '*' in tbl_id:
                     raise ValueError("Error in row {} - table is not valid ".format(str(row_num)))
@@ -539,14 +557,18 @@ if __name__ == '__main__':
 
         name_ext_table=row[7]
 
-        gcs_lifecycle_policy=row[8]
-        try:
-            if gcs_lifecycle_policy == '':
-                gcs_lifecycle_policy = {}
-            else:
-                gcs_lifecycle_policy=json.loads(gcs_lifecycle_policy)
-        except ValueError:
-            raise ValueError('gcs life cycle policy in row {} is not a valid json'.format(str(row_num)))
+        # gcs_lifecycle_policy=row[8]
+        # try:
+        #     if gcs_lifecycle_policy == '':
+        #         gcs_lifecycle_policy = {}
+        #     else:
+        #         gcs_lifecycle_policy=json.loads(gcs_lifecycle_policy)
+        # except ValueError:
+        #     raise ValueError('gcs life cycle policy in row {} is not a valid json'.format(str(row_num)))
+
+        gcs_storage_class = row[8]
+        if gcs_storage_class == '':
+            gcs_storage_class='NEARLINE'
 
         select_date_for_exporting = row[9]
         table_name_pattern= row[10]
@@ -571,7 +593,8 @@ if __name__ == '__main__':
                                 'remove_orig_data':remove_orig_data,
                                 'gcs_dest_bucket':gcs_dest_bucket,
                                 'name_ext_table':name_ext_table,
-                                'gcs_lifecycle_policy':gcs_lifecycle_policy,
+                                'gcs_storage_class':gcs_storage_class,
+                                # 'gcs_lifecycle_policy':gcs_lifecycle_policy,
                                 'select_date_for_exporting':select_date_for_exporting,
                                 'table_name_pattern':table_name_pattern
                             }
@@ -598,7 +621,8 @@ if __name__ == '__main__':
                         'remove_orig_data': remove_orig_data,
                         'gcs_dest_bucket': gcs_dest_bucket,
                         'name_ext_table': name_ext_table,
-                        'gcs_lifecycle_policy': gcs_lifecycle_policy,
+                        'gcs_storage_class':gcs_storage_class,
+                        # 'gcs_lifecycle_policy': gcs_lifecycle_policy,
                         'select_date_for_exporting': select_date_for_exporting,
                         'table_name_pattern': table_name_pattern
                     }
@@ -628,7 +652,8 @@ if __name__ == '__main__':
                 'remove_orig_data': remove_orig_data,
                 'gcs_dest_bucket': gcs_dest_bucket,
                 'name_ext_table': name_ext_table,
-                'gcs_lifecycle_policy': gcs_lifecycle_policy,
+                'gcs_storage_class': gcs_storage_class,
+                # 'gcs_lifecycle_policy': gcs_lifecycle_policy,
                 'select_date_for_exporting': select_date_for_exporting,
                 'table_name_pattern': table_name_pattern
             }
@@ -656,7 +681,8 @@ if __name__ == '__main__':
                 'remove_orig_data': remove_orig_data,
                 'gcs_dest_bucket': gcs_dest_bucket,
                 'name_ext_table': name_ext_table,
-                'gcs_lifecycle_policy': gcs_lifecycle_policy,
+                'gcs_storage_class': gcs_storage_class,
+                # 'gcs_lifecycle_policy': gcs_lifecycle_policy,
                 'select_date_for_exporting': select_date_for_exporting,
                 'table_name_pattern': table_name_pattern
             }
@@ -675,7 +701,8 @@ if __name__ == '__main__':
                 'remove_orig_data': remove_orig_data,
                 'gcs_dest_bucket': gcs_dest_bucket,
                 'name_ext_table': name_ext_table,
-                'gcs_lifecycle_policy': gcs_lifecycle_policy,
+                # 'gcs_lifecycle_policy': gcs_lifecycle_policy,
+                'gcs_storage_class': gcs_storage_class,
                 'select_date_for_exporting': select_date_for_exporting,
                 'table_name_pattern': table_name_pattern
             }
@@ -695,9 +722,9 @@ if __name__ == '__main__':
         else:
             seen[item['tbl_id']]=1
     duplicate_items = {k:v for k,v in seen.items() if v>1}
-    if len(duplicate_items) > 0:
-        print(duplicate_items)
-        raise ValueError('There are duplicate tables specified in the input files, please check in the input')
+    # if len(duplicate_items) > 0:
+    #     print(duplicate_items)
+    #     raise ValueError('There are duplicate tables specified in the input files, please check in the input')
 
     print('----------------Phase 2 - Processing Tables ----------------')
     for item in list_ops_by_phy_table:
