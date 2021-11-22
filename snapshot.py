@@ -231,7 +231,7 @@ if __name__ == '__main__':
         if dest_table == '':
             dest_table=input_table + '_' + date.today().strftime('%Y%m%d')
         dest_tbl_id=dest_project + '.' + dest_dataset + '.' + dest_table
-        if validate_table(client,dest_table):
+        if validate_table(client,dest_tbl_id):
                 raise ValueError('Table {} already exist, please give a new table name.'.format(dest_table))
 
         bq_endpoint = 'https://bigquery.googleapis.com/bigquery/v2/projects/{}/jobs'.format(input_project)
@@ -252,7 +252,7 @@ if __name__ == '__main__':
                             "tableId": dest_table
                           },
                           "operationType": "SNAPSHOT",
-                          "writeDisposition": "WRITE_EMPTY",
+                          "writeDisposition": "WRITE_TRUNCATE",
                         }
                       }
                     })
