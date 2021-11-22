@@ -20,7 +20,7 @@ def validate_project(client,proj_id):
 
 def validate_dataset(client,ds_id):
     try:
-        tables = client.list_tables(ds_id)
+        tables = client.get_dataset(ds_id)
         return True
     except Exception:
         # raise ValueError('The dataset id {} is not valid'.format(ds_id))
@@ -478,10 +478,6 @@ if __name__ == '__main__':
     values = gsheet.get('values', [])[1:]  # Data is 2-dimension array list
 
     client = bigquery.Client()
-    ds_id = 'allen-first.aftership'
-    tables = client.list_tables(ds_id)
-    for table in tables:
-        print(table)
     gcs_client=storage.Client()
     row_num=2
     list_ops_by_table=[]
